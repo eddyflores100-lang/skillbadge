@@ -195,15 +195,72 @@ const CHECKS: CheckDef[] = [
     severity: "critical",
     title: "Hardcoded secret / API key",
     explanation:
-      "Looks like a real credential embedded in the file (Stripe/OpenAI-style keys, GitHub tokens, AWS keys, private keys, or high-entropy assignments). Secrets belong in environment variables, never in a SKILL.md.",
+      "Looks like a real credential embedded in the file (Stripe/OpenAI/Anthropic-style keys, GitHub/GitLab tokens, AWS keys, Google/HuggingFace/Slack/npm/SendGrid tokens, private keys, or high-entropy assignments). Secrets belong in environment variables, never in a SKILL.md.",
     patterns: [
-      /sk-(live|proj|test)-[A-Za-z0-9]{16,}/,
-      /\b(ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}/,
-      /\bxox[baprs]-[A-Za-z0-9-]{10,}/,
+      // Stripe (legacy live/test + restricted keys).
+      /sk-(live|test|proj)-[A-Za-z0-9]{16,}/,
+      /rk_(live|test)_[A-Za-z0-9]{24,}/,
+      // OpenAI (old sk-... and new sk-proj-... / sk-svcacct-... formats).
+      /\bsk-[A-Za-z0-9]{20,}\b/,
+      /\bsk-proj-[A-Za-z0-9_-]{40,}\b/,
+      /\bsk-svcacct-[A-Za-z0-9_-]{20,}\b/,
+      // Anthropic.
+      /\bsk-ant-api[0-9]{2}-[A-Za-z0-9_-]{60,}\b/,
+      // GitHub tokens (PAT, oauth, user-to-server, server-to-server, refresh).
+      /\b(ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{30,}\b/,
+      // GitLab personal access tokens.
+      /\bglpat-[A-Za-z0-9_-]{20,}\b/,
+      // Slack tokens (bot, app, user, refresh, access).
+      /\bxox[baprs]-[A-Za-z0-9-]{10,}\b/,
+      // AWS access key id + STS session token.
       /\bAKIA[0-9A-Z]{16}\b/,
+      /\bASIA[0-9A-Z]{16}\b/,
+      // Google API key.
+      /\bAIza[0-9A-Za-z_-]{35}\b/,
+      // HuggingFace access tokens.
+      /\bhf_[A-Za-z0-9]{30,}\b/,
+      // npm publish tokens.
+      /\bnpm_[A-Za-z0-9]{36,}\b/,
+      // SendGrid API keys.
+      /\bSG\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{32,}\b/,
+      // Mailgun API keys.
+      /\bkey-[a-f0-9]{32}\b/,
+      // Twilio Account SID (AC + 32 hex).
+      /\bAC[a-f0-9]{32}\b/,
+      // Linear / Postman API keys.
+      /\blin_api_[A-Za-z0-9]{30,}\b/,
+      /\bPMAK-[A-Za-z0-9-]{24,}\b/,
+      // Discord bot tokens (bot id . timestamp . hmac — three base64 chunks).
+      /\b[A-Za-z0-9]{24}\.[A-Za-z0-9]{6}\.[A-Za-z0-9_-]{27,}\b/,
+      // Cloudflare API tokens (named prefix form).
+      /\b[cC]f[-_]?[tT]oken[-_]?[A-Za-z0-9_-]{30,}\b/,
+      // PEM blocks (RSA/EC/OpenSSH/DSA, plus the PGP PRIVATE KEY BLOCK form).
       /-----BEGIN (RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----/,
-      /(api[_-]?key|secret|passwd|password|access[_-]?token)\s*[:=]\s*["'][A-Za-z0-9_\-./+]{16,}["']/i,
+      /-----BEGIN PGP PRIVATE KEY BLOCK-----/,
+      // High-entropy assignments to obviously secret-named keys.
+      // Skip placeholder values like "xxxx...", "your_key", "example_key", "<...>",
+      // "...", "***", "changeme", "todo", "tbd" — they are not real secrets.
+      // Implemented via the `whole` function below to keep one regex per line.
     ],
+    whole: (content: string): Match[] => {
+      const PLACEHOLDER_RE =
+        /(xxxx|your[_-]|example|placeholder|redacted|changeme|change-me|<[^>]+>|\.\.\.|\*\*\*|dummy|sample|test-?key|fake|insert|replace|todo|tbd|\$\{)/i;
+      const REPEATED_CHAR_RE = /^(.)\1{15,}$/; // 16+ of the same character
+      const SECRET_NAME_RE =
+        /(api[_-]?key|secret|passwd|password|access[_-]?token|auth[_-]?token|bearer[_-]?token|client[_-]?secret|private[_-]?key)\s*[:=]\s*["']([^"']+)["']/i;
+      const matches: Match[] = [];
+      const lines = content.split("\n");
+      lines.forEach((line, i) => {
+        const m = line.match(SECRET_NAME_RE);
+        if (!m) return;
+        const value = m[2];
+        if (value.length < 16) return;
+        if (PLACEHOLDER_RE.test(value)) return;
+        if (REPEATED_CHAR_RE.test(value)) return;
+        matches.push({ line: i + 1, snippet: line.trim().slice(0, 180) });
+      });
+      return matches;
+    },
   },
   {
     id: "env-exfil",
@@ -308,9 +365,7 @@ export function scanSkill(content: string, fileName: string): ScanResult {
 
   for (const check of CHECKS) {
     const matches: Match[] = [];
-    if (check.whole) {
-      matches.push(...check.whole(content));
-    } else if (check.patterns) {
+    if (check.patterns) {
       lines.forEach((line, i) => {
         for (const re of check.patterns!) {
           re.lastIndex = 0;
@@ -320,6 +375,9 @@ export function scanSkill(content: string, fileName: string): ScanResult {
           }
         }
       });
+    }
+    if (check.whole) {
+      matches.push(...check.whole(content));
     }
     if (matches.length === 0) continue;
     const severity = check.escalate?.(matches) ?? check.severity;
